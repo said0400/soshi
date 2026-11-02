@@ -1,0 +1,34 @@
+# ── أسرار ──
+.env
+.env.*
+!.env.example
+
+# ── Python ──
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# ── قاعدة البيانات (تُحفظ كـ artifact، لا تُرفع للمستودع) ──
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+
+# ── مخرجات الإنتاج المؤقتة ──
+output/
+tmp/
+*.log
+
+# ── Node ──
+node_modules/
+
+# ── نظام/محررات ──
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# ── ملاحظة: assets/ (موسيقى، sfx، صور bg_*.png) و scripts/*.xlsx تُرفع عمداً.
+#    لا تضع ما لا تملك ترخيصه في مستودع عام.
