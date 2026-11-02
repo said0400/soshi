@@ -1,0 +1,31 @@
+# ══════════════════════════════════════════════════════════════════════
+# requirements.txt — Video Pipeline v4.0
+# Python 3.10+  (يُختبر على 3.11)
+#
+# نظام (Ubuntu):   sudo apt-get install -y ffmpeg fonts-noto fonts-noto-core \
+#                      fonts-hosny-amiri fonts-sil-scheherazade
+# Python:          pip install -r requirements.txt
+# Node (الريندر):  cd remotion && npm ci
+# المتصفح:         cd remotion && npx playwright install chromium --with-deps
+#
+# ⚠️ playwright مُثبَّت بنفس الإصدار في Python وNode (1.50.0) فيستعملان
+#    نفس نسخة المتصفح، وأمر تثبيت واحد يكفي.
+# ⚠️ لا PyTorch ولا openai-whisper: Whisper يعمل عبر faster-whisper (CTranslate2).
+# ══════════════════════════════════════════════════════════════════════
+
+# ── الذكاء الاصطناعي ──
+google-genai>=1.10.0,<2.0.0
+groq>=0.15.0,<1.0.0
+
+# ── التعرف على الكلام (توقيت الكلمات) ──
+faster-whisper>=1.1.0,<2.0.0
+
+# ── الملفات والشبكة ──
+openpyxl>=3.1.5,<4.0.0
+requests>=2.32.3,<3.0.0
+
+# ── Cloudflare R2 (S3 API) ──
+boto3>=1.35.0,<2.0.0
+
+# ── صورة Long المصغرة (HTML → PNG) ──
+playwright==1.50.0
