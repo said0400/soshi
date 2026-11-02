@@ -1,0 +1,20 @@
+name = "video-publisher"
+main = "src/index.js"
+compatibility_date = "2024-11-01"
+
+# يعمل كل دقيقة
+[triggers]
+crons = ["* * * * *"]
+
+# نفس الـ bucket الذي يرفع إليه GitHub
+[[r2_buckets]]
+binding = "BUCKET"
+bucket_name = "REPLACE_WITH_YOUR_BUCKET_NAME"
+
+[vars]
+MAX_LATE_MIN = "180"      # بعدها يُعتبر الفيديو فائتاً (failed/)
+RETENTION_HOURS = "48"    # حذف videos/ sent/ failed/ بعد 48 ساعة
+
+# الأسرار (لا تُكتب هنا):
+#   npx wrangler secret put MAKE_WEBHOOK_URL_AR   (و _FR و _EN و _ES)
+#   npx wrangler secret put MAKE_AUTH_TOKEN       (اختياري)
