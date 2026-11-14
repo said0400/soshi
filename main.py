@@ -1,22 +1,23 @@
 #!/usr/bin/env python3
 """
-main.py — المنسّق الرئيسي (v2.0)
+main.py — المنسّق الرئيسي (v3.0)
 
-يعمل على GitHub Actions للإنتاج فقط. النشر يتولاه Cloudflare Worker (مجلد worker/).
+يعمل على GitHub Actions للإنتاج. لا خوادم ولا بطاقة دفع:
 
-سير العمل:
-  1) produce: لكل موعد نشر اقترب → ينتج الفيديو → يرفعه إلى R2
-              ويكتب بجانبه  queue/{وقت}_{لغة}_{نوع}_{رقم}.json
-  2) Cloudflare Worker (كل دقيقة): يقرأ queue/ ويرسل Webhook إلى Make عند الموعد
-              ثم ينقل الملف إلى sent/ ويحذف كل شيء بعد 48 ساعة.
+  1) produce : لكل موعد نشر اقترب → ينتج الفيديو → يرفعه كأصل في GitHub Release "media"
+               ويكتب صفاً في Google Sheet (عبر Apps Script) فيه كل بيانات النشر.
+  2) Google Apps Script (كل دقيقة): عند حلول الموعد يرسل Webhook واحداً إلى سيناريو
+               Make الواحد، فيحمّل Make الفيديو من الرابط وينشر على يوتيوب وفيسبوك.
+  3) cleanup : يحذف أصول الفيديو الأقدم من 48 ساعة.
 
 حالة الإنتاج (أرقام مستخدمة، كاش AI، مخزون مستخدم) في قاعدة لكل لغة:
-  R2: state/vsg_{lang}.db  ← تُنزَّل في بداية التشغيل وتُرفع بعد كل فيديو.
+  Release "state": vsg_{lang}.db ← تُنزَّل في بداية التشغيل وتُرفع بعد كل فيديو.
   (concurrency في الـ workflow يمنع تشغيلين متزامنين لنفس اللغة)
 
 الأوامر:
   produce   ينتج ما اقترب موعده            --lang ar|fr|en|es|all  --mode short|long|all
   due       يطبع اللغات التي لها فيديو مستحق الإنتاج (JSON)
+  cleanup   حذف أصول الفيديو الأقدم من 48 ساعة
   run       إنتاج يدوي لفيديو واحد         --lang --mode [--video-number] [--no-upload]
   check     فحص البيئة والمفاتيح
   status    ملخص القواعد
@@ -39,6 +40,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
+import requests
+
 import config as C
 import db
 from audio import get_audio_duration, produce_audio
@@ -51,129 +54,225 @@ EMOJI_LEFT, EMOJI_RIGHT = "🔥", "💥"
 MIN_CLIP = 0.8
 MAX_SHORT_CLIP = 15.0
 
-VIDEOS_PREFIX = "videos/"
-QUEUE_PREFIX = "queue/"
-SENT_PREFIX = "sent/"
-STATE_PREFIX = "state/"
-PLATFORMS = ("youtube", "facebook")      # أضف "instagram" هنا + مسار في Make لتفعيله
 
 
 # ═══════════════════════════════════════════════════════════════
-# 1) Cloudflare R2
+# 1) GitHub Releases (تخزين الفيديوهات + حالة اللغات)
 # ═══════════════════════════════════════════════════════════════
 
-class R2:
-    """عميل R2 (S3 API). boto3 يُستورد كسولاً."""
+class GitHubStore:
+    """يخزّن الملفات كأصول (assets) في Releases. المستودع عام فالروابط عامة."""
+
+    API = "https://api.github.com"
+    UPLOAD = "https://uploads.github.com"
 
     def __init__(self) -> None:
-        self.cfg = C.r2_settings()
-        self._client: Any = None
+        g = C.github_settings()
+        self.token, self.repo = g["token"], g["repo"]
+        self._releases: dict[str, dict] = {}
 
     def configured(self) -> bool:
-        return all(self.cfg[k] for k in ("account_id", "access_key", "secret_key", "bucket"))
+        return bool(self.token and self.repo)
 
-    @property
-    def client(self) -> Any:
-        if self._client is None:
-            import boto3
-            from botocore.config import Config
-            self._client = boto3.client(
-                "s3",
-                endpoint_url=f"https://{self.cfg['account_id']}.r2.cloudflarestorage.com",
-                aws_access_key_id=self.cfg["access_key"],
-                aws_secret_access_key=self.cfg["secret_key"],
-                region_name="auto",
-                config=Config(retries={"max_attempts": 5, "mode": "standard"},
-                              signature_version="s3v4"))
-        return self._client
+    def _headers(self, **extra: str) -> dict[str, str]:
+        return {"Authorization": f"Bearer {self.token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28", **extra}
 
-    def upload(self, path: Path, key: str, content_type: str) -> str:
-        """يرفع ملفاً ويرجع رابطاً يحمّله Make."""
-        log.info("  ☁️  R2 ↑ %s (%.1f MB)", key, path.stat().st_size / 1_048_576)
-        self.client.upload_file(str(path), self.cfg["bucket"], key,
-                                ExtraArgs={"ContentType": content_type})
-        return self.url(key)
+    def release(self, tag: str) -> dict:
+        """يجلب الـ Release بوسم معيّن أو ينشئه."""
+        if tag in self._releases:
+            return self._releases[tag]
+        url = f"{self.API}/repos/{self.repo}/releases"
+        r = requests.get(f"{url}/tags/{tag}", headers=self._headers(), timeout=30)
+        if r.status_code == 404:
+            r = requests.post(url, headers=self._headers(), timeout=30, json={
+                "tag_name": tag, "name": tag, "prerelease": True,
+                "body": "Automated storage — do not edit or delete."})
+            if r.status_code == 422:                        # سباق: أنشأه job آخر للتو
+                r = requests.get(f"{url}/tags/{tag}", headers=self._headers(), timeout=30)
+        r.raise_for_status()
+        self._releases[tag] = r.json()
+        return self._releases[tag]
 
-    def url(self, key: str) -> str:
-        if self.cfg["public_url"]:
-            return f"{self.cfg['public_url']}/{key}"
-        return self.client.generate_presigned_url(
-            "get_object", Params={"Bucket": self.cfg["bucket"], "Key": key},
-            ExpiresIn=C.R2_PRESIGN_SECONDS)
+    def assets(self, tag: str) -> list[dict]:
+        rid = self.release(tag)["id"]
+        out: list[dict] = []
+        page = 1
+        while True:
+            r = requests.get(f"{self.API}/repos/{self.repo}/releases/{rid}/assets",
+                             headers=self._headers(), params={"per_page": 100, "page": page},
+                             timeout=30)
+            r.raise_for_status()
+            batch = r.json()
+            out.extend(batch)
+            if len(batch) < 100:
+                return out
+            page += 1
 
-    def put_json(self, key: str, obj: dict) -> None:
-        self.client.put_object(Bucket=self.cfg["bucket"], Key=key,
-                               Body=json.dumps(obj, ensure_ascii=False).encode("utf-8"),
-                               ContentType="application/json")
+    def delete_asset(self, asset_id: int) -> None:
+        r = requests.delete(f"{self.API}/repos/{self.repo}/releases/assets/{asset_id}",
+                            headers=self._headers(), timeout=30)
+        if r.status_code not in (204, 404):
+            r.raise_for_status()
 
-    def download(self, key: str, dest: Path) -> bool:
-        """يحمّل ملفاً. False إن لم يوجد."""
-        try:
-            self.client.download_file(self.cfg["bucket"], key, str(dest))
+    def upload_asset(self, path: Path, name: str, content_type: str, tag: str,
+                     replace: bool = False) -> str:
+        """يرفع ملفاً (حتى 2GB) ويرجع رابط التحميل العام."""
+        rel = self.release(tag)
+        if replace:
+            for a in self.assets(tag):
+                if a["name"] == name:
+                    self.delete_asset(a["id"])
+        log.info("  ☁️  GitHub ↑ %s (%.1f MB)", name, path.stat().st_size / 1_048_576)
+        last: Optional[Exception] = None
+        for attempt in range(3):
+            try:
+                with open(path, "rb") as f:
+                    r = requests.post(
+                        f"{self.UPLOAD}/repos/{self.repo}/releases/{rel['id']}/assets",
+                        params={"name": name}, data=f, timeout=(30, 900),
+                        headers=self._headers(**{"Content-Type": content_type}))
+                if r.status_code == 422:               # الاسم موجود (محاولة سابقة انقطعت)
+                    for a in self.assets(tag):
+                        if a["name"] == name:
+                            self.delete_asset(a["id"])
+                    continue
+                r.raise_for_status()
+                return r.json()["browser_download_url"]
+            except Exception as e:
+                last = e
+                time.sleep(5 * (attempt + 1))
+        raise RuntimeError(f"upload failed for {name}: {last}")
+
+    def download_asset(self, tag: str, name: str, dest: Path) -> bool:
+        """يحمّل أصلاً بالاسم. False إن لم يوجد."""
+        for a in self.assets(tag):
+            if a["name"] != name:
+                continue
+            with requests.get(f"{self.API}/repos/{self.repo}/releases/assets/{a['id']}",
+                              headers=self._headers(Accept="application/octet-stream"),
+                              stream=True, timeout=(30, 300)) as r:
+                r.raise_for_status()
+                with open(dest, "wb") as f:
+                    for chunk in r.iter_content(1 << 20):
+                        f.write(chunk)
             return True
-        except Exception as e:
-            msg = str(e)
-            if "404" in msg or "Not Found" in msg or "NoSuchKey" in msg:
-                return False
-            raise
+        return False
 
-    def any_with_prefix(self, prefix: str) -> bool:
-        r = self.client.list_objects_v2(Bucket=self.cfg["bucket"], Prefix=prefix, MaxKeys=1)
-        return bool(r.get("KeyCount", 0))
+    def delete_older_than(self, tag: str, hours: int) -> int:
+        cutoff = now_utc() - timedelta(hours=hours)
+        n = 0
+        for a in self.assets(tag):
+            created = datetime.strptime(a["created_at"], "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=timezone.utc)
+            if created < cutoff:
+                self.delete_asset(a["id"])
+                n += 1
+        return n
 
 
-_r2: Optional[R2] = None
+_store: Optional[GitHubStore] = None
 
 
-def r2() -> R2:
-    global _r2
-    if _r2 is None:
-        _r2 = R2()
-    return _r2
+def store() -> GitHubStore:
+    global _store
+    if _store is None:
+        _store = GitHubStore()
+    return _store
 
 
 # ═══════════════════════════════════════════════════════════════
-# 2) حالة الإنتاج: قاعدة لكل لغة في R2
+# 2) صندوق النشر: Google Sheet عبر Apps Script
+# ═══════════════════════════════════════════════════════════════
+
+class SheetQueue:
+    """يكتب صفاً لكل فيديو في الـ Sheet. Apps Script يرسله إلى Make عند الموعد."""
+
+    def __init__(self) -> None:
+        a = C.apps_script_settings()
+        self.url, self.secret = a["url"], a["secret"]
+
+    def configured(self) -> bool:
+        return bool(self.url and self.secret)
+
+    def _call(self, payload: dict) -> dict:
+        body = json.dumps({"secret": self.secret, **payload}, ensure_ascii=False)
+        last = ""
+        for attempt in range(3):
+            try:
+                r = requests.post(self.url, data=body.encode("utf-8"), timeout=60,
+                                  headers={"Content-Type": "text/plain; charset=utf-8"})
+                data = r.json()
+                if data.get("ok"):
+                    return data
+                last = str(data.get("error", "unknown"))
+            except Exception as e:
+                last = str(e)[:150]
+            time.sleep(3 * (attempt + 1))
+        raise RuntimeError(f"Apps Script call failed: {last}")
+
+    def enqueue(self, item: dict) -> None:
+        self._call({"action": "enqueue", "item": item})
+
+    def exists(self, sid: str) -> bool:
+        return bool(self._call({"action": "exists", "id": sid}).get("exists"))
+
+
+_queue: Optional[SheetQueue] = None
+
+
+def queue() -> SheetQueue:
+    global _queue
+    if _queue is None:
+        _queue = SheetQueue()
+    return _queue
+
+
+# ═══════════════════════════════════════════════════════════════
+# 2b) حالة الإنتاج: قاعدة لكل لغة في Release "state"
 # ═══════════════════════════════════════════════════════════════
 
 class _State:
-    def __init__(self, lang: str, local: Path, remote_key: str, remote: bool, write: bool):
-        self.lang, self.local, self.remote_key = lang, local, remote_key
+    def __init__(self, lang: str, local: Path, name: str, remote: bool, write: bool):
+        self.lang, self.local, self.name = lang, local, name
         self.remote, self.write = remote, write
 
     def save(self) -> None:
-        """يدمج WAL ويرفع القاعدة إلى R2 (بعد كل فيديو لتفادي ضياع الحالة)."""
+        """يدمج WAL ويرفع القاعدة (بعد كل فيديو لتفادي ضياع الحالة)."""
         if not (self.remote and self.write):
             return
         db.checkpoint_and_close()
-        r2().upload(self.local, self.remote_key, "application/octet-stream")
+        store().upload_asset(self.local, self.name, "application/octet-stream",
+                             C.STATE_TAG, replace=True)
         db.use_database(self.local)
         db.init_db()
 
 
 @contextmanager
 def lang_state(lang: str, remote: bool = True, write: bool = True) -> Iterator[_State]:
-    """ينزّل vsg_{lang}.db من R2، يفتحها، وعند الخروج يرفعها (إن write)."""
-    use_remote = remote and r2().configured()
+    """ينزّل vsg_{lang}.db من GitHub، يفتحها، وعند الخروج يرفعها (إن write)."""
+    use_remote = remote and store().configured()
     local = C.BASE_DIR / f"vsg_{lang}.db"
-    key = f"{STATE_PREFIX}vsg_{lang}.db"
+    name = f"vsg_{lang}.db"
     if use_remote:
         for suffix in ("", "-wal", "-shm"):
             Path(f"{local}{suffix}").unlink(missing_ok=True)
-        if r2().download(key, local):
-            log.info("  📥 state %s restored from R2", lang.upper())
+        if store().download_asset(C.STATE_TAG, name, local):
+            log.info("  📥 state %s restored", lang.upper())
         else:
             log.info("  🆕 state %s: new database", lang.upper())
     db.use_database(local)
     db.init_db()
-    st = _State(lang, local, key, use_remote, write)
+    st = _State(lang, local, name, use_remote, write)
     try:
         yield st
     finally:
         db.checkpoint_and_close()
         if use_remote and write:
             try:
-                r2().upload(local, key, "application/octet-stream")
+                store().upload_asset(local, name, "application/octet-stream",
+                                     C.STATE_TAG, replace=True)
             except Exception as e:
                 log.error("  ❌ cannot upload state %s: %s", lang, e)
                 raise
@@ -249,11 +348,8 @@ def slots_to_produce(lang: str, mode: str, now: datetime) -> list[datetime]:
 
 
 def already_queued(lang: str, mode: str, when: datetime) -> bool:
-    """حماية من التكرار: هل يوجد في R2 عنصر لنفس الموعد (queue/ أو sent/)؟"""
-    if not r2().configured():
-        return False
-    stem = f"{compact(when)}_{lang}_{mode}_"
-    return r2().any_with_prefix(QUEUE_PREFIX + stem) or r2().any_with_prefix(SENT_PREFIX + stem)
+    """حماية من التكرار: هل يوجد صف لنفس الموعد في الـ Sheet؟"""
+    return queue().configured() and queue().exists(slot_key(lang, mode, when))
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -393,64 +489,60 @@ def build_video(record: dict, lang: str, mode: str, out_dir: Path,
             "publish": build_publish_payload(record, ai, lang, mode)}
 
 
-def _asset_key(lang: str, mode: str, num: str, kind: str, ext: str) -> str:
+def _asset_name(lang: str, mode: str, num: str, kind: str, ext: str) -> str:
     stamp = now_utc().strftime("%Y%m%dT%H%M%S")
-    return f"{VIDEOS_PREFIX}{lang}/{mode}/{num}_{stamp}_{kind}.{ext}"
+    safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in str(num))
+    return f"{lang}_{mode}_{safe}_{stamp}_{kind}.{ext}"
 
 
 def upload_video(built: dict, lang: str, mode: str, num: str) -> dict:
     """Short: ملف واحد للمنصتين. Long: يوتيوب أفقي + فيسبوك عمودي + صورة مصغرة."""
-    store = r2()
-    yt_key = _asset_key(lang, mode, num, "yt", "mp4")
-    yt_url = store.upload(built["final"], yt_key, "video/mp4")
+    st = store()
+    yt_name = _asset_name(lang, mode, num, "yt", "mp4")
+    yt_url = st.upload_asset(built["final"], yt_name, "video/mp4", C.MEDIA_TAG)
     if mode == "short":
-        fb_key, fb_url = yt_key, yt_url
+        fb_url = yt_url
     else:
-        fb_key = _asset_key(lang, mode, num, "fb", "mp4")
-        fb_url = store.upload(built["fb"], fb_key, "video/mp4")
-    thumb_key = thumb_url = ""
+        fb_url = st.upload_asset(built["fb"], _asset_name(lang, mode, num, "fb", "mp4"),
+                                 "video/mp4", C.MEDIA_TAG)
+    thumb_url = ""
     if built.get("thumb"):
-        thumb_key = _asset_key(lang, mode, num, "thumb", "jpg")
-        thumb_url = store.upload(built["thumb"], thumb_key, "image/jpeg")
-    return {"yt_key": yt_key, "fb_key": fb_key, "thumb_key": thumb_key,
-            "yt_url": yt_url, "fb_url": fb_url, "thumb_url": thumb_url}
+        thumb_url = st.upload_asset(built["thumb"], _asset_name(lang, mode, num, "thumb", "jpg"),
+                                    "image/jpeg", C.MEDIA_TAG)
+    return {"yt_url": yt_url, "fb_url": fb_url, "thumb_url": thumb_url}
 
 
 # ═══════════════════════════════════════════════════════════════
-# 7) صندوق النشر (queue/*.json) — يقرؤه Cloudflare Worker
+# 7) طلب Make: طلب واحد لكل فيديو يحمل المنصتين (سيناريو واحد في Make)
 # ═══════════════════════════════════════════════════════════════
 
 def build_queue_item(sid: str, lang: str, mode: str, num: str, title: str,
                      publish_at: datetime, payload: dict, up: dict) -> dict:
-    """عنصر واحد لكل فيديو. الـ Worker يرسل body كما هو ويضيف auth من أسراره."""
-    common = {
-        "lang": lang, "content_mode": mode, "video_number": num, "title": payload["title"],
-        "publish_at": iso(publish_at), "is_short": mode == "short",
-        "hashtags": payload["hashtags"],
+    """
+    الصف الذي يُكتب في الـ Sheet. حقل payload هو ما يُرسَل حرفياً إلى Webhook في Make
+    (يضيف Apps Script الحقل auth من أسراره).
+    """
+    tags = payload["youtube_tags"]
+    make_payload = {
+        "idempotency_key": sid,
+        "lang": lang,
+        "content_mode": mode,
+        "is_short": mode == "short",
+        "video_number": num,
+        "publish_at": iso(publish_at),
+        "title": payload["title"],
+        "video_url_youtube": up["yt_url"],
+        "video_url_facebook": up["fb_url"],
+        "description_youtube": payload["youtube_description"],
+        "caption_facebook": payload["facebook_caption"],
+        "tags": tags,
+        "tags_csv": ",".join(tags),
+        "hashtags_text": " ".join(payload["hashtags"][:15]),
+        "thumbnail_url": up.get("thumb_url", ""),
     }
-    bodies = {
-        "youtube": {**common, "platform": "youtube", "video_url": up["yt_url"],
-                    "description": payload["youtube_description"],
-                    "tags": payload["youtube_tags"], "thumbnail_url": up.get("thumb_url", "")},
-        "facebook": {**common, "platform": "facebook", "video_url": up["fb_url"],
-                     "description": payload["facebook_caption"]},
-    }
-    platforms = {}
-    for p in PLATFORMS:
-        body = dict(bodies[p])
-        body["idempotency_key"] = f"{sid}_{p}"          # لتفادي التكرار داخل Make
-        platforms[p] = {"body": body, "sent_at": None, "attempts": 0, "last_error": None}
-    return {
-        "version": 1, "id": sid, "lang": lang, "content_mode": mode,
-        "video_number": num, "title": title,
-        "publish_at": iso(publish_at), "created_at": iso(now_utc()),
-        "platforms": platforms,
-        "assets": [k for k in (up["yt_key"], up["fb_key"], up["thumb_key"]) if k],
-    }
-
-
-def queue_key(lang: str, mode: str, num: str, publish_at: datetime) -> str:
-    return f"{QUEUE_PREFIX}{compact(publish_at)}_{lang}_{mode}_{num}.json"
+    return {"id": sid, "lang": lang, "content_mode": mode, "video_number": num,
+            "title": title, "publish_at": iso(publish_at), "created_at": iso(now_utc()),
+            "payload": make_payload}
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -482,7 +574,7 @@ def produce_slot(lang: str, mode: str, when: datetime, out_dir: Path, state: _St
     if prev and prev["status"] == "failed":
         db.delete_video(prev["id"])
     if not key_override and already_queued(lang, mode, when):
-        log.warning("  ⏭️  %s already in R2 queue/sent — skipping duplicate", sid)
+        log.warning("  ⏭️  %s already in the Sheet queue — skipping duplicate", sid)
         return False
 
     record = record or pick_record(lang, mode)
@@ -506,12 +598,11 @@ def produce_slot(lang: str, mode: str, when: datetime, out_dir: Path, state: _St
         up = upload_video(built, lang, mode, num)
         item = build_queue_item(sid, lang, mode, num, record["title"], when,
                                 built["publish"], up)
-        r2().put_json(queue_key(lang, mode, num, when), item)       # ← يظهر للـ Worker الآن
-        db.mark_ready(vid, built["duration"], yt_path=up["yt_url"], fb_path=up["fb_url"],
-                      yt_r2_key=up["yt_key"], fb_r2_key=up["fb_key"],
-                      thumb_r2_key=up["thumb_key"])
+        queue().enqueue(item)                                       # ← يظهر لـ Apps Script الآن
+        db.mark_ready(vid, built["duration"], yt_url=up["yt_url"], fb_url=up["fb_url"],
+                      thumb_url=up["thumb_url"])
         state.save()                                                # احفظ الحالة فوراً
-        log.info("  ✅ #%s queued — Worker will send at %s", num, iso(when))
+        log.info("  ✅ #%s queued — Apps Script will send to Make at %s", num, iso(when))
         return True
     except Exception as e:
         log.error("  ❌ #%s failed: %s", num, e)
@@ -582,7 +673,7 @@ def cmd_due(args: argparse.Namespace) -> int:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    """إنتاج يدوي لفيديو واحد. --no-upload يبقي الملفات محلياً بلا R2."""
+    """إنتاج يدوي لفيديو واحد. --no-upload يبقي الملفات محلياً بلا رفع."""
     lang, mode = args.lang, args.mode
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -624,8 +715,8 @@ def cmd_check(_: argparse.Namespace) -> int:
                              ("PEXELS_API_KEY", True), ("PIXABAY_API_KEY", False)):
         n = len(C.get_ring(prefix))
         line(prefix, n > 0 or not required, f"{n} key(s)")
-    line("R2", r2().configured(),
-         "public URL" if C.r2_settings()["public_url"] else "presigned URLs")
+    line("GitHub token/repo", store().configured(), "GITHUB_TOKEN + GITHUB_REPOSITORY")
+    line("Apps Script", queue().configured(), "APPS_SCRIPT_URL + APPS_SCRIPT_SECRET")
     for lang in C.LANGS:
         for mode in C.MODES:
             line(f"scripts/{lang}_{mode}.xlsx", C.script_path(lang, mode).exists())
@@ -639,8 +730,22 @@ def cmd_check(_: argparse.Namespace) -> int:
     has_music = C.MUSIC_DIR.is_dir() and any(
         p.suffix.lower() in (".mp3", ".wav", ".m4a") for p in C.MUSIC_DIR.rglob("*"))
     line("music", has_music, "assets/music")
-    print("\n  (روابط Make تُضبط كأسرار في Cloudflare Worker وليس هنا)\n")
+    print("\n  (رابط Make يُضبط في Script Properties داخل Google Apps Script وليس هنا)\n")
     return 0 if ok else 1
+
+
+def cmd_cleanup(args: argparse.Namespace) -> int:
+    """يحذف من Release "media" كل أصل مضى عليه 48 ساعة."""
+    if not store().configured():
+        log.warning("  ⚠️  GitHub not configured — nothing to clean")
+        return 0
+    if args.dry_run:
+        old = [a["name"] for a in store().assets(C.MEDIA_TAG)]
+        log.info("  🔍 [dry-run] %d asset(s) currently in release", len(old))
+        return 0
+    n = store().delete_older_than(C.MEDIA_TAG, C.MEDIA_RETENTION_HOURS)
+    log.info("  🗑️  deleted %d asset(s) older than %dh", n, C.MEDIA_RETENTION_HOURS)
+    return 0
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -684,6 +789,10 @@ def parse_args() -> argparse.Namespace:
 
     sp = sub.add_parser("check", help="فحص البيئة")
     sp.set_defaults(fn=cmd_check)
+
+    sp = sub.add_parser("cleanup", help="حذف أصول الفيديو الأقدم من 48 ساعة")
+    sp.add_argument("--dry-run", action="store_true")
+    sp.set_defaults(fn=cmd_cleanup)
 
     sp = sub.add_parser("status", help="ملخص القواعد")
     sp.add_argument("--lang", default="all", choices=["all", *C.LANGS])
