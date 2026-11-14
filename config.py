@@ -2,7 +2,7 @@
 config.py — الإعدادات المركزية للمشروع (v1.0)
 
 يضم: المسارات، اللغات والمناطق الزمنية، التاجات، أسلوب الشارع لكل لغة،
-إعدادات Gemini/Groq/R2/Make، قراءة المفاتيح مع التدوير، وأبعاد الفيديو.
+إعدادات Gemini/Groq/GitHub Releases/Apps Script/Make، قراءة المفاتيح مع التدوير، وأبعاد الفيديو.
 
 لا يحتوي أي منطق إنتاج. كل الملفات الأخرى تستورد منه فقط.
 """
@@ -112,12 +112,15 @@ PUBLISH_SLOTS: dict[str, dict[str, list[tuple]]] = {
 
 
 # ═══════════════════════════════════════════════════════════════
-# R2 (الفيديوهات + صندوق النشر + حالة القواعد)  — Make يستدعيه Cloudflare Worker
+# التخزين والنشر: GitHub Releases + Google Sheet (Apps Script) + Make
 # ═══════════════════════════════════════════════════════════════
+#   الفيديوهات     → أصول (assets) في Release بوسم "media"   (تُحذف بعد 48 ساعة)
+#   حالة اللغات    → أصول في Release بوسم "state"            (vsg_{lang}.db)
+#   صندوق النشر    → Google Sheet يديره Apps Script (يرسل إلى Make عند الموعد)
 
-R2_RETENTION_HOURS = 48
-R2_PRESIGN_SECONDS = 60 * 60 * 24 * 3   # صلاحية الرابط إن لم يكن الـ bucket عاماً
-
+MEDIA_TAG = "media"
+STATE_TAG = "state"
+MEDIA_RETENTION_HOURS = 48
 
 
 def get_env(key: str, default: str = "") -> str:
@@ -129,14 +132,14 @@ def get_env_lang(key: str, lang: str) -> str:
     return get_env(f"{key}_{lang.upper()}") or get_env(key)
 
 
-def r2_settings() -> dict[str, str]:
-    return {
-        "account_id": get_env("R2_ACCOUNT_ID"),
-        "access_key": get_env("R2_ACCESS_KEY_ID"),
-        "secret_key": get_env("R2_SECRET_ACCESS_KEY"),
-        "bucket":     get_env("R2_BUCKET"),
-        "public_url": get_env("R2_PUBLIC_BASE_URL").rstrip("/"),
-    }
+def github_settings() -> dict[str, str]:
+    """GITHUB_TOKEN وGITHUB_REPOSITORY (owner/repo) — يوفرهما GitHub Actions تلقائياً."""
+    return {"token": get_env("GITHUB_TOKEN"), "repo": get_env("GITHUB_REPOSITORY")}
+
+
+def apps_script_settings() -> dict[str, str]:
+    """رابط Web App (…/exec) والسرّ المشترك مع Apps Script."""
+    return {"url": get_env("APPS_SCRIPT_URL"), "secret": get_env("APPS_SCRIPT_SECRET")}
 
 
 # ═══════════════════════════════════════════════════════════════
