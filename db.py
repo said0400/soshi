@@ -5,9 +5,9 @@ db.py — قاعدة بيانات SQLite مبسطة (v1.0)
   used_videos : فيديوهات Pexels/Pixabay المستخدمة (لعدم التكرار)
   ai_cache    : نتائج الذكاء الاصطناعي (JSON واحد لكل فيديو)
   videos      : دورة حياة الإنتاج: pending → rendering → ready | failed
-              (النشر الفعلي يتولاه Cloudflare Worker عبر صندوق R2، لا يمرّ بهذه القاعدة)
+              (النشر الفعلي يتولاه Google Apps Script عبر الـ Sheet، لا يمرّ بهذه القاعدة)
 
-قاعدة لكل لغة (vsg_{lang}.db) تُحفظ في R2 بين التشغيلات — انظر use_database().
+قاعدة لكل لغة (vsg_{lang}.db) تُحفظ في GitHub Release "state" بين التشغيلات — انظر use_database().
 
 كل الأوقات UTC بصيغة واحدة: YYYY-MM-DDTHH:MM:SSZ  (انظر config.utc_iso)
 """
@@ -73,7 +73,7 @@ def use_database(path: "str | Path") -> None:
 
 
 def checkpoint_and_close() -> None:
-    """يدمج WAL في الملف الرئيسي ويغلق الاتصال — قبل رفع الملف إلى R2."""
+    """يدمج WAL في الملف الرئيسي ويغلق الاتصال — قبل رفع الملف إلى GitHub."""
     c = getattr(_local, "conn", None)
     if c is not None:
         try:
@@ -154,11 +154,9 @@ _SCHEMA = [
         title        TEXT,
         status       TEXT NOT NULL DEFAULT 'pending',
         publish_at   TEXT,
-        yt_path      TEXT,
-        fb_path      TEXT,
-        yt_r2_key    TEXT,
-        fb_r2_key    TEXT,
-        thumb_r2_key TEXT,
+        yt_url       TEXT,
+        fb_url       TEXT,
+        thumb_url    TEXT,
         duration_s   REAL,
         error        TEXT,
         archived     INTEGER NOT NULL DEFAULT 0,
@@ -318,22 +316,16 @@ def set_status(video_id: int, status: str, error: str = "") -> None:
         )
 
 
-def mark_ready(video_id: int, duration_s: float,
-               yt_path: str = "", fb_path: str = "",
-               yt_r2_key: str = "", fb_r2_key: str = "",
-               thumb_r2_key: str = "") -> None:
-    """الفيديو جاهز ومرفوع على R2 وينتظر وقت النشر."""
+def mark_ready(video_id: int, duration_s: float, yt_url: str = "", fb_url: str = "",
+               thumb_url: str = "") -> None:
+    """الفيديو جاهز ومرفوع على GitHub Release وصفّه في الـ Sheet بانتظار وقت النشر."""
     with write_transaction() as c:
         c.execute(
-            """UPDATE videos SET status='ready', duration_s=?, yt_path=?, fb_path=?,
-                   yt_r2_key=?, fb_r2_key=?, thumb_r2_key=?, error=NULL, updated_at=?
-               WHERE id=?""",
-            (float(duration_s), yt_path or None, fb_path or None,
-             yt_r2_key or None, fb_r2_key or None, thumb_r2_key or None,
+            """UPDATE videos SET status='ready', duration_s=?, yt_url=?, fb_url=?,
+                   thumb_url=?, error=NULL, updated_at=? WHERE id=?""",
+            (float(duration_s), yt_url or None, fb_url or None, thumb_url or None,
              utc_iso(), video_id),
         )
-
-
 
 
 def mark_failed(video_id: int, error: str) -> None:
