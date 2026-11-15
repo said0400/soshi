@@ -1,6 +1,6 @@
 name: 🎬 Produce videos
 
-# الإنتاج فقط. النشر يتولاه Cloudflare Worker (مجلد worker/) كل دقيقة.
+# الإنتاج فقط. النشر: Google Apps Script (مجلد apps_script/) كل دقيقة → سيناريو Make الواحد.
 on:
   schedule:
     - cron: "*/15 * * * *"
@@ -26,7 +26,7 @@ on:
         default: false
 
 permissions:
-  contents: read
+  contents: write        # لرفع/حذف أصول Releases (media + state)
 
 env:
   PYTHON_VERSION: "3.11"
@@ -49,15 +49,12 @@ jobs:
           cache: pip
 
       - name: Install minimal deps
-        run: pip install requests boto3 openpyxl
+        run: pip install requests openpyxl
 
       - name: Pick languages
         id: pick
         env:
-          R2_ACCOUNT_ID:        ${{ secrets.R2_ACCOUNT_ID }}
-          R2_ACCESS_KEY_ID:     ${{ secrets.R2_ACCESS_KEY_ID }}
-          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          R2_BUCKET:            ${{ secrets.R2_BUCKET }}
+          GITHUB_TOKEN:         ${{ github.token }}
           EVENT:                ${{ github.event_name }}
           IN_LANG:              ${{ inputs.lang }}
         run: |
@@ -70,6 +67,11 @@ jobs:
           else
             python main.py due
           fi
+
+      - name: 🗑️ Delete videos older than 48h
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python main.py cleanup
 
   # ── 2) ثقيل: لغة واحدة لكل job (concurrency لكل لغة) ───────────────────────
   produce:
@@ -133,11 +135,9 @@ jobs:
           GROQ_API_KEY:         ${{ secrets.GROQ_API_KEY }}
           PEXELS_API_KEY:       ${{ secrets.PEXELS_API_KEY }}
           PIXABAY_API_KEY:      ${{ secrets.PIXABAY_API_KEY }}
-          R2_ACCOUNT_ID:        ${{ secrets.R2_ACCOUNT_ID }}
-          R2_ACCESS_KEY_ID:     ${{ secrets.R2_ACCESS_KEY_ID }}
-          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          R2_BUCKET:            ${{ secrets.R2_BUCKET }}
-          R2_PUBLIC_BASE_URL:   ${{ secrets.R2_PUBLIC_BASE_URL }}
+          GITHUB_TOKEN:         ${{ github.token }}
+          APPS_SCRIPT_URL:      ${{ secrets.APPS_SCRIPT_URL }}
+          APPS_SCRIPT_SECRET:   ${{ secrets.APPS_SCRIPT_SECRET }}
         run: python main.py check || true
 
       - name: 🎬 Produce
@@ -146,11 +146,9 @@ jobs:
           GROQ_API_KEY:         ${{ secrets.GROQ_API_KEY }}
           PEXELS_API_KEY:       ${{ secrets.PEXELS_API_KEY }}
           PIXABAY_API_KEY:      ${{ secrets.PIXABAY_API_KEY }}
-          R2_ACCOUNT_ID:        ${{ secrets.R2_ACCOUNT_ID }}
-          R2_ACCESS_KEY_ID:     ${{ secrets.R2_ACCESS_KEY_ID }}
-          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          R2_BUCKET:            ${{ secrets.R2_BUCKET }}
-          R2_PUBLIC_BASE_URL:   ${{ secrets.R2_PUBLIC_BASE_URL }}
+          GITHUB_TOKEN:         ${{ github.token }}
+          APPS_SCRIPT_URL:      ${{ secrets.APPS_SCRIPT_URL }}
+          APPS_SCRIPT_SECRET:   ${{ secrets.APPS_SCRIPT_SECRET }}
           LANG_CODE:            ${{ matrix.lang }}
           IN_MODE:              ${{ inputs.mode }}
           IN_MAX:               ${{ inputs.max_videos }}
